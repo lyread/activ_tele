@@ -1,3 +1,4 @@
+import struct
 import numpy as np
 import threading
 import time
@@ -8,7 +9,7 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import ( LowCmd_  as hg_LowCmd, LowS
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.utils.crc import CRC
 
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import ( LowCmd_  as go_LowCmd, LowState_ as go_LowState)  # idl for h1
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import ( LowCmd_  as go_LowCmd, LowState_ as go_LowState, SportModeState_ as hg_SportModeState)  # idl for h1
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
 
 import logging_mp
@@ -59,15 +60,15 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self,networkInterface = 'enxa0cec8616f27', motion_mode = False, simulation_mode = False):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
-        self.kp_high = 300.0
+        self.kp_high = 330.0
         self.kd_high = 3.0
-        self.kp_low = 80.0
+        self.kp_low = 120.0 #increase to make bring robot's arms higher
         self.kd_low = 3.0
         self.kp_wrist = 40.0
         self.kd_wrist = 1.5
@@ -79,12 +80,16 @@ class G1_29_ArmController:
         self._speed_gradual_max = False
         self._gradual_start_time = None
         self._gradual_time = None
+        
+        self.controller_data = None
+        self.robot_vel = [0.0, 0.0, 0.0]
+        self.robot_pos = [0.0, 0.0, 0.0]
 
         # initialize lowcmd publisher and lowstate subscriber
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, networkInterface)
 
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
@@ -93,6 +98,11 @@ class G1_29_ArmController:
         self.lowcmd_publisher.Init()
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
+
+        self.odometry_subscriber = ChannelSubscriber("rt/odommodestate",hg_SportModeState)
+
+        self.odometry_subscriber.Init()
+
         self.lowstate_buffer = DataBuffer()
 
         # initialize subscribe thread
@@ -147,12 +157,17 @@ class G1_29_ArmController:
     def _subscribe_motor_state(self):
         while True:
             msg = self.lowstate_subscriber.Read()
+            msg_high = self.odometry_subscriber.Read()
             if msg is not None:
+                self.controller_data = msg.wireless_remote 
                 lowstate = G1_29_LowState()
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
                 self.lowstate_buffer.SetData(lowstate)
+            if msg_high is not None:
+                self.robot_vel = list(msg_high.velocity)
+                self.robot_pos = list(msg_high.position)
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
@@ -218,6 +233,35 @@ class G1_29_ArmController:
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
+    
+    def get_current_robot_velocity(self):
+        return np.array(self.robot_vel)
+    
+    def get_current_robot_position(self):
+        return np.array(self.robot_pos)
+    
+    def get_velocity_commands(self):
+        #based on example script from unitree
+        lx_offset = 4
+        rx_offset = 8
+        ry_offset = 12
+        L2_offset = 16
+        ly_offset = 20
+        if self.controller_data is None:
+            return [0.0, 0.0, 0.0]
+        commands = {
+            "controller_side_vel": struct.unpack('<f', self.controller_data[lx_offset:lx_offset + 4])[0], #Lx
+            "controller_rot_vel": struct.unpack('<f', self.controller_data[rx_offset:rx_offset + 4])[0], #Rx
+            "Ry": struct.unpack('<f', self.controller_data[ry_offset:ry_offset + 4])[0],
+            "L2": struct.unpack('<f', self.controller_data[L2_offset:L2_offset + 4])[0], # Placeholder, unused
+            "controller_forward_vel": struct.unpack('<f', self.controller_data[ly_offset:ly_offset + 4])[0], #Ly
+        }
+        velocity_commands = [
+            commands["controller_forward_vel"], 
+            commands["controller_side_vel"], 
+            commands["controller_rot_vel"],  
+            ]
+        return velocity_commands
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
@@ -345,14 +389,13 @@ class G1_29_JointIndex(IntEnum):
     kNotUsedJoint5 = 34
 
 class G1_23_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, networkInterface = 'eno1', motion_mode = False, simulation_mode = False):
         self.simulation_mode = simulation_mode
-        self.motion_mode = motion_mode
-
+        
         logger_mp.info("Initialize G1_23_ArmController...")
         self.q_target = np.zeros(10)
         self.tauff_target = np.zeros(10)
-
+        self.motion_mode = motion_mode
         self.kp_high = 300.0
         self.kd_high = 3.0
         self.kp_low = 80.0
@@ -372,15 +415,16 @@ class G1_23_ArmController:
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
-        
+            ChannelFactoryInitialize(0, networkInterface)
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
         else:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
         self.lowcmd_publisher.Init()
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
+        self.odometry_subscriber = ChannelSubscriber("rt/odommodestate",hg_SportModeState)
         self.lowstate_subscriber.Init()
+        self.odometry_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
 
         # initialize subscribe thread
@@ -435,11 +479,13 @@ class G1_23_ArmController:
     def _subscribe_motor_state(self):
         while True:
             msg = self.lowstate_subscriber.Read()
-            if msg is not None:
+            msg_high = self.odometry_subscriber.Read()
+            if msg and msg_high is not None:
                 lowstate = G1_23_LowState()
                 for id in range(G1_23_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                robot_vel = list(msg_high.velocity)
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
@@ -509,12 +555,12 @@ class G1_23_ArmController:
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
-        logger_mp.info("[G1_23_ArmController] ctrl_dual_arm_go_home start...")
+        logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(10)
-            # self.tauff_target = np.zeros(10)
+            self.q_target = np.zeros(14)
+            # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
@@ -625,9 +671,8 @@ class G1_23_JointIndex(IntEnum):
     kNotUsedJoint5 = 34
 
 class H1_2_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, simulation_mode = False):
         self.simulation_mode = simulation_mode
-        self.motion_mode = motion_mode
         
         logger_mp.info("Initialize H1_2_ArmController...")
         self.q_target = np.zeros(14)
@@ -652,12 +697,8 @@ class H1_2_ArmController:
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
-
-        if self.motion_mode:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
-        else:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
+            ChannelFactoryInitialize(0, networkInterface)
+        self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
         self.lowcmd_publisher.Init()
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
@@ -731,9 +772,6 @@ class H1_2_ArmController:
         return cliped_arm_q_target
 
     def _ctrl_motor_state(self):
-        if self.motion_mode:
-            self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = 1.0;
-
         while True:
             start_time = time.time()
 
@@ -799,10 +837,6 @@ class H1_2_ArmController:
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
             if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = weight;
-                        time.sleep(0.02)
                 logger_mp.info("[H1_2_ArmController] both arms have reached the home position.")
                 break
             current_attempts += 1
@@ -936,7 +970,7 @@ class H1_ArmController:
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, networkInterface)
         self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, go_LowCmd)
         self.lowcmd_publisher.Init()
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, go_LowState)
@@ -1140,10 +1174,10 @@ if __name__ == "__main__":
     from robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
     import pinocchio as pin 
 
-    arm_ik = G1_29_ArmIK(Unit_Test = True, Visualization = False)
-    arm = G1_29_ArmController(simulation_mode=True)
-    # arm_ik = G1_23_ArmIK(Unit_Test = True, Visualization = False)
-    # arm = G1_23_ArmController()
+    #arm_ik = G1_29_ArmIK(Unit_Test = True, Visualization = False)
+    #arm = G1_29_ArmController(simulation_mode=True)
+    arm_ik = G1_23_ArmIK(Unit_Test = True, Visualization = False)
+    arm = G1_23_ArmController()
     # arm_ik = H1_2_ArmIK(Unit_Test = True, Visualization = False)
     # arm = H1_2_ArmController()
     # arm_ik = H1_ArmIK(Unit_Test = True, Visualization = True)

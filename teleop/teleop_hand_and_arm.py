@@ -7,6 +7,8 @@ import threading
 import logging_mp
 logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
+from scipy.spatial.transform import Rotation as R
+
 
 import os 
 import sys
@@ -17,7 +19,8 @@ sys.path.append(parent_dir)
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
-from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller, Dex1_1_Gripper_Controller
+from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller, Dex1_1_Gripper_Controller,Dex3_1_Controller_console
+from teleop.robot_control.robot_hand_inspire import Inspire_Controller
 from teleop.robot_control.robot_hand_inspire import Inspire_Controller
 from teleop.robot_control.robot_hand_brainco import Brainco_Controller
 from teleop.image_server.image_client import ImageClient
@@ -73,6 +76,66 @@ def get_state() -> dict:
         "RECORD_READY": RECORD_READY,
     }
 
+
+def quat_to_offset(quat, max_angle=(50, 40)):
+    """
+    Convert a quaternion into planar offset ratios (dx, dy).
+    max_angle: (maximum horizontal angle, maximum vertical angle).
+    """
+    r = R.from_quat(quat)
+    roll, pitch, yaw = r.as_euler('xyz', degrees=True)
+    #MAPING
+    dx = np.clip(yaw / max_angle[0], -1, 1)  
+    dy = np.clip(-pitch / max_angle[1], -1, 1)  
+    return dx, dy
+
+def update_move_image_from_tv(tv_img_array, move_image_img_array, dx, dy):
+    H, W, _ = tv_img_array.shape
+    h, w, _ = move_image_img_array.shape
+
+    x0 = int((W - w) * (dx + 1) / 2)
+    y0 = int((H - h) * (dy + 1) / 2)
+
+
+    x0 = np.clip(x0, 0, W - w)
+    y0 = np.clip(y0, 0, H - h)
+
+    sub_image = tv_img_array[y0:y0 + h, x0:x0 + w, :]
+    np.copyto(move_image_img_array, sub_image)
+
+
+
+def teledata_to_list(tele_data):
+    result = []
+    result.extend(tele_data.head_pose.flatten().tolist())
+
+    for val in [
+        tele_data.left_pinch_value,
+        tele_data.right_pinch_value,
+        tele_data.left_trigger_value,
+        tele_data.right_trigger_value
+    ]:
+        result.append(0.0 if val is None else val)
+
+
+    s = tele_data.tele_state
+
+
+    bools = [
+        s.left_pinch_state, s.left_squeeze_state,
+        s.right_pinch_state, s.right_squeeze_state,
+        s.left_trigger_state, s.left_squeeze_ctrl_state,
+        s.left_thumbstick_state, s.left_aButton, s.left_bButton,
+        s.right_trigger_state, s.right_squeeze_ctrl_state,
+        s.right_thumbstick_state, s.right_aButton, s.right_bButton,
+    ]
+    result.extend([float(b) for b in bools])
+
+    result.extend(s.left_thumbstick_value.tolist())
+    result.extend(s.right_thumbstick_value.tolist())
+
+    return result
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'save data\'s frequency')
@@ -92,6 +155,7 @@ if __name__ == '__main__':
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task name for recording')
     parser.add_argument('--task-desc', type = str, default = 'e.g. pick the red cube on the table.', help = 'task goal for recording')
 
+    parser.add_argument('--move-image', action='store_true', default=False, help='Enable active image head tracking')
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
 
@@ -126,6 +190,21 @@ if __name__ == '__main__':
                 'wrist_camera_image_shape': [480, 640],  # Wrist camera resolution
                 'wrist_camera_id_numbers': [2, 4],
             }
+        if args.move_image:
+            img_config.update({
+                'move_image_type': 'opencv',
+                'move_image_shape': [240, 640],  # Resolution of active cam
+                'move_image_id_numbers': [5],
+            })
+
+        if args.move_image:
+            # Use active camera for VR headset with full resolution
+            move_image_img_shape = (img_config['move_image_shape'][0], img_config['move_image_shape'][1], 3)  # 720x2560 for VR
+            logger_mp.info("Using move_image for VR headset with full resolution [240, 640]")
+        else:
+            # Use head camera
+            move_image_img_shape = (img_config['head_camera_image_shape'][0], img_config['head_camera_image_shape'][1], 3)  # Standard head camera resolution for VR
+            logger_mp.info("Using head camera for VR headset")
 
 
         ASPECT_RATIO_THRESHOLD = 2.0 # If the aspect ratio exceeds this value, it is considered binocular
@@ -142,10 +221,17 @@ if __name__ == '__main__':
             tv_img_shape = (img_config['head_camera_image_shape'][0], img_config['head_camera_image_shape'][1] * 2, 3)
         else:
             tv_img_shape = (img_config['head_camera_image_shape'][0], img_config['head_camera_image_shape'][1], 3)
+        
+        if args.move_image:
+            # if BINOCULAR and not (move_image_img_shape[1] / move_image_img_shape[0] > ASPECT_RATIO_THRESHOLD):
+            #     move_image_img_shape = (move_image_img_shape[0], move_image_img_shape[1] * 2, 3)
+            move_image_img_shm = shared_memory.SharedMemory(create = True, size = np.prod(move_image_img_shape) * np.uint8().itemsize)
+            move_image_img_array = np.ndarray(move_image_img_shape, dtype = np.uint8, buffer = move_image_img_shm.buf)
 
+        # 1. 创建共享内存
         tv_img_shm = shared_memory.SharedMemory(create = True, size = np.prod(tv_img_shape) * np.uint8().itemsize)
         tv_img_array = np.ndarray(tv_img_shape, dtype = np.uint8, buffer = tv_img_shm.buf)
-
+        #如果有手腕相机（WRIST），也会同样创建共享内存：
         if WRIST and args.sim:
             wrist_img_shape = (img_config['wrist_camera_image_shape'][0], img_config['wrist_camera_image_shape'][1] * 2, 3)
             wrist_img_shm = shared_memory.SharedMemory(create = True, size = np.prod(wrist_img_shape) * np.uint8().itemsize)
@@ -160,15 +246,18 @@ if __name__ == '__main__':
                                     wrist_img_shape = wrist_img_shape, wrist_img_shm_name = wrist_img_shm.name)
         else:
             img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name)
-
+        #图像由 ImageClient 线程接收：
         image_receive_thread = threading.Thread(target = img_client.receive_process, daemon = True)
         image_receive_thread.daemon = True
         image_receive_thread.start()
-
+        update_move_image_from_tv(tv_img_array, move_image_img_array, 0, 0)
         # television: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(binocular=BINOCULAR, use_hand_tracking=args.xr_mode == "hand", img_shape=tv_img_shape, img_shm_name=tv_img_shm.name, 
+        # TeleVuerWrapper 是 XR 显示端接口，它通过 共享内存名字 tv_img_shm.name 来访问图像。
+        tv_wrapper = TeleVuerWrapper(binocular=BINOCULAR, use_hand_tracking=args.xr_mode == "hand", img_shape=move_image_img_shape, img_shm_name=move_image_img_shm.name, 
                                     return_state_data=True, return_hand_rot_data = False)
 
+        dx, dy=quat_to_offset(tv_wrapper.get_head_orientation())
+        update_move_image_from_tv(tv_img_array, move_image_img_array, dx, dy)
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
@@ -184,13 +273,25 @@ if __name__ == '__main__':
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
 
         # end-effector
-        if args.ee == "dex3":
+        if args.ee == "dex3" and args.xr_mode == "hand":
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
             dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
             hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+        elif args.ee == "dex3" and args.xr_mode == "controller":
+            left_hand_value_in = Value('d', 0.0, lock=True)      # [input]
+            right_hand_value_in = Value('d', 0.0, lock=True)     # [input]
+            left_aButton_in  = Value('b', False, lock=True)         
+            left_bButton_in = Value('b', False, lock=True)
+            right_aButton_in = Value('b', False, lock=True)
+            right_bButton_in = Value('b', False, lock=True)
+            dual_hand_data_lock = Lock()
+            dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
+            dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
+            hand_ctrl = Dex3_1_Controller_console(left_hand_value_in, right_hand_value_in, left_aButton_in,left_bButton_in,right_aButton_in,right_bButton_in,
+                                                    dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         elif args.ee == "dex1":
             left_gripper_value = Value('d', 0.0, lock=True)        # [input]
             right_gripper_value = Value('d', 0.0, lock=True)       # [input]
@@ -284,6 +385,9 @@ if __name__ == '__main__':
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
+                        # Reset position reference at episode start
+                        episode_start_position = arm_ctrl.get_current_robot_position().copy()
+                        logger_mp.info(f"Episode started - position offset set to: {episode_start_position}")
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:
@@ -298,6 +402,21 @@ if __name__ == '__main__':
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+
+            elif args.ee == "dex3" and args.xr_mode == "controller":
+                with left_hand_value_in.get_lock():
+                    left_hand_value_in.value = tele_data.left_trigger_value
+                with right_hand_value_in.get_lock():
+                    right_hand_value_in.value = tele_data.right_trigger_value
+                with left_aButton_in.get_lock():
+                    left_aButton_in.value = tele_data.tele_state.left_aButton  # True / False
+                with left_bButton_in.get_lock():
+                    left_bButton_in.value = tele_data.tele_state.left_bButton
+                with right_aButton_in.get_lock():
+                    right_aButton_in.value = tele_data.tele_state.right_aButton
+                with right_bButton_in.get_lock():
+                    right_bButton_in.value = tele_data.tele_state.right_bButton
+
             elif args.ee == "dex1" and args.xr_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_trigger_value
@@ -314,12 +433,12 @@ if __name__ == '__main__':
             # high level control
             if args.xr_mode == "controller" and args.motion:
                 # quit teleoperate
-                if tele_data.tele_state.right_aButton:
-                    START = False
-                    STOP = True
+                if tele_data.tele_state.right_aButton and tele_data.tele_state.right_bButton:
+                    stop_listening()
+                    running = False
                 # command robot to enter damping mode. soft emergency stop function
-                if tele_data.tele_state.left_thumbstick_state and tele_data.tele_state.right_thumbstick_state:
-                    sport_client.Damp()
+                # if tele_data.tele_state.left_thumbstick_state and tele_data.tele_state.right_thumbstick_state:
+                #     sport_client.Damp()
                 # control, limit velocity to within 0.3
                 sport_client.Move(-tele_data.tele_state.left_thumbstick_value[1]  * 0.3,
                                   -tele_data.tele_state.left_thumbstick_value[0]  * 0.3,
@@ -329,12 +448,31 @@ if __name__ == '__main__':
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
 
+            # get current robot velocity data from odometry subscriber
+            robot_vel = arm_ctrl.get_current_robot_velocity()
+            # get current robot position data from odometry subscriber
+            raw_robot_pos = arm_ctrl.get_current_robot_position()
+
+            controller_combination = teledata_to_list(tele_data)
+
+            if episode_start_position is not None:
+                robot_pos = [
+                    raw_robot_pos[0] - episode_start_position[0],
+                    raw_robot_pos[1] - episode_start_position[1],
+                    raw_robot_pos[2] - episode_start_position[2]
+                ]
+            else:
+                robot_pos = raw_robot_pos
+
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_arm_pose, tele_data.right_arm_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            #robot_vel_action = arm_ctrl.get_velocity_commands() #unitree controller
+            robot_vel_action = [-tele_data.tele_state.left_thumbstick_value[1]  * 0.6, -tele_data.tele_state.left_thumbstick_value[0]  * 0.6, -tele_data.tele_state.right_thumbstick_value[0]  * 0.6] #metaquest controller
+            
 
             # record data
             if args.record:
@@ -383,6 +521,8 @@ if __name__ == '__main__':
                     current_body_action = []
                 # head image
                 current_tv_image = tv_img_array.copy()
+                current_move_image = move_image_img_array.copy()
+                
                 # wrist image
                 if WRIST:
                     current_wrist_image = wrist_img_array.copy()
@@ -394,6 +534,10 @@ if __name__ == '__main__':
                 if RECORD_RUNNING:
                     colors = {}
                     depths = {}
+                    # move image recorde
+                    if args.move_image:
+                        colors[f"color_{4}"] = current_move_image[:, :move_image_img_shape[1]//2]
+                        colors[f"color_{5}"] = current_move_image[:, move_image_img_shape[1]//2:]
                     if BINOCULAR:
                         colors[f"color_{0}"] = current_tv_image[:, :tv_img_shape[1]//2]
                         colors[f"color_{1}"] = current_tv_image[:, tv_img_shape[1]//2:]
@@ -426,9 +570,21 @@ if __name__ == '__main__':
                             "qvel":   [],                           
                             "torque": [],  
                         }, 
-                        "body": {
-                            "qpos": current_body_state,
+                        "body_vel": {
+                            "qpos": [],
+                            "qvel": robot_vel if isinstance(robot_vel, list) else robot_vel.tolist(),
+                            "torque": [],
                         }, 
+                        "odometry": {
+                            "qpos": robot_pos if isinstance(robot_pos, list) else robot_pos.tolist(), 
+                            "qvel": [],
+                            "torque": [],
+                        },
+                        "controller": {
+                            "qpos": controller_combination, #controller_combination if isinstance(controller_combination, list) else controller_combination.tolist(), 
+                            "qvel": [],
+                            "torque": [],
+                        },
                     }
                     actions = {
                         "left_arm": {                                   
@@ -451,9 +607,16 @@ if __name__ == '__main__':
                             "qvel":   [],       
                             "torque": [], 
                         }, 
-                        "body": {
-                            "qpos": current_body_action,
-                        }, 
+                        "body_vel": {
+                            "qpos": [], 
+                            "qvel": robot_vel_action if isinstance(robot_vel_action, list) else robot_vel_action.tolist(),
+                            "torque": [],
+                        },
+                        "odometry": {
+                            "qpos": [], #keep empty for now
+                            "qvel": [],
+                            "torque": [],
+                        },
                     }
                     if args.sim:
                         sim_state = sim_state_subscriber.read_data()            
@@ -485,6 +648,10 @@ if __name__ == '__main__':
         if WRIST:
             wrist_img_shm.close()
             wrist_img_shm.unlink()
+        if args.move_image:
+            # Use active camera for VR headset with full resolution
+            move_image_img_shm.close()
+            move_image_img_shm.unlink()
 
         if args.record:
             recorder.close()
