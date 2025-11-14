@@ -420,7 +420,7 @@ class Dex3_1_Controller_console:
 
         simulation_mode: Whether to use simulation mode (default is False, which means using real robot)
         """
-        logger_mp.info("Initialize Dex3_1_Controller...")
+        logger_mp.info("Initialize Dex3_1_Controller_console")
 
         self.fps = fps
         self.Unit_Test = Unit_Test  #用来验证算法正确性，controller不用
