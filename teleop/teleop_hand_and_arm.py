@@ -77,32 +77,71 @@ def get_state() -> dict:
     }
 
 
-def quat_to_offset(quat, max_angle=(50, 40)):
+def quat_to_offset(quat, max_angle=(30, 20)):
     """
-    Convert a quaternion into planar offset ratios (dx, dy).
-    max_angle: (maximum horizontal angle, maximum vertical angle).
+    Convert head quaternion to screen offset (-1~1 for dx, dy)
+    dx: left-right (yaw)
+    dy: up-down (pitch)
     """
+    if quat is None or len(quat) != 4:
+        logger_mp.warning(f"Invalid quat: {quat}, using default [0,0,0,1]")
+        quat = [0, 0, 0, 1]
+
     r = R.from_quat(quat)
-    roll, pitch, yaw = r.as_euler('xyz', degrees=True)
-    #MAPING
-    dx = np.clip(yaw / max_angle[0], -1, 1)  
-    dy = np.clip(-pitch / max_angle[1], -1, 1)  
+
+    # Important: VR head often uses yaw-pitch-roll = (Y, X, Z) order
+    yaw, pitch, roll = r.as_euler('yxz', degrees=True)
+
+    # Mapping:
+    # yaw → left/right
+    # pitch → up/down
+    dx = np.clip(-yaw / max_angle[0], -1, 1)     # 左右转头
+    dy = np.clip(-pitch / max_angle[1], -1, 1)  # 点头，上下
+    
     return dx, dy
 
-def update_move_image_from_tv(tv_img_array, move_image_img_array, dx, dy):
-    H, W, _ = tv_img_array.shape
-    h, w, _ = move_image_img_array.shape
 
+
+
+def update_move_image_from_tv(tv_img_array, move_image_img_array, dx, dy):
+    """
+    Update move_image_img_array based on head offsets (dx, dy)
+    Works for binocular images:
+        - tv_img_array: (H, 2W, 3)
+        - move_image_img_array: (h, 2w, 3)
+    """
+    H, W2, _ = tv_img_array.shape
+    h, w2, _ = move_image_img_array.shape
+    W = W2 // 2        # each eye width
+    w = w2 // 2        # each eye width
+
+    # Split tv image into left-eye and right-eye images
+    tv_left  = tv_img_array[:, :W, :]
+    tv_right = tv_img_array[:, W:, :]
+
+    # Output placeholders
+    out_left  = np.zeros((h, w, 3), dtype=np.uint8)
+    out_right = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # Convert dx dy to pixel offsets (use same mapping for both eyes)
     x0 = int((W - w) * (dx + 1) / 2)
     y0 = int((H - h) * (dy + 1) / 2)
-
 
     x0 = np.clip(x0, 0, W - w)
     y0 = np.clip(y0, 0, H - h)
 
-    sub_image = tv_img_array[y0:y0 + h, x0:x0 + w, :]
-    np.copyto(move_image_img_array, sub_image)
+    # Crop left eye
+    sub_left = tv_left[y0:y0+h, x0:x0+w, :]
+    # Crop right eye
+    sub_right = tv_right[y0:y0+h, x0:x0+w, :]
 
+    np.copyto(out_left, sub_left)
+    np.copyto(out_right, sub_right)
+
+    # Stitch back into the output image
+    move_image_img_array[:, :w, :] = out_left
+    move_image_img_array[:, w:, :] = out_right# Copy to output
+    
 
 
 def teledata_to_list(tele_data):
@@ -135,6 +174,7 @@ def teledata_to_list(tele_data):
     result.extend(s.right_thumbstick_value.tolist())
 
     return result
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -194,7 +234,7 @@ if __name__ == '__main__':
             img_config.update({
                 'move_image_type': 'opencv',
                 'move_image_shape': [240, 640],  # Resolution of active cam
-                'move_image_id_numbers': [5],
+                'move_image_id_numbers': [5,6],
             })
 
         if args.move_image:
@@ -250,14 +290,12 @@ if __name__ == '__main__':
         image_receive_thread = threading.Thread(target = img_client.receive_process, daemon = True)
         image_receive_thread.daemon = True
         image_receive_thread.start()
-        update_move_image_from_tv(tv_img_array, move_image_img_array, 0, 0)
+
         # television: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         # TeleVuerWrapper 是 XR 显示端接口，它通过 共享内存名字 tv_img_shm.name 来访问图像。
         tv_wrapper = TeleVuerWrapper(binocular=BINOCULAR, use_hand_tracking=args.xr_mode == "hand", img_shape=move_image_img_shape, img_shm_name=move_image_img_shm.name, 
                                     return_state_data=True, return_hand_rot_data = False)
-
-        dx, dy=quat_to_offset(tv_wrapper.get_head_orientation())
-        update_move_image_from_tv(tv_img_array, move_image_img_array, dx, dy)
+        
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
@@ -354,7 +392,7 @@ if __name__ == '__main__':
             recorder = EpisodeWriter(task_dir = args.task_dir + args.task_name, task_goal = args.task_desc, frequency = args.frequency, rerun_log = False)
         elif args.record and not args.headless:
             recorder = EpisodeWriter(task_dir = args.task_dir + args.task_name, task_goal = args.task_desc, frequency = args.frequency, rerun_log = True)
-
+        episode_start_position = None  
 
         logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
         while not START and not STOP:
@@ -397,6 +435,9 @@ if __name__ == '__main__':
                         publish_reset_category(1, reset_pose_publisher)
             # get input data
             tele_data = tv_wrapper.get_motion_state_data()
+            quat = tv_wrapper.get_head_orientation()
+            dx, dy=quat_to_offset(quat)
+            update_move_image_from_tv(tv_img_array, move_image_img_array, dx, dy)
             if (args.ee == "dex3" or args.ee == "inspire1" or args.ee == "brainco") and args.xr_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -570,6 +611,11 @@ if __name__ == '__main__':
                             "qvel":   [],                           
                             "torque": [],  
                         }, 
+                        "head_offset": {
+                            "qpos": [dx, dy],
+                            "qvel": [],
+                            "torque": []
+                        },
                         "body_vel": {
                             "qpos": [],
                             "qvel": robot_vel if isinstance(robot_vel, list) else robot_vel.tolist(),
@@ -630,8 +676,11 @@ if __name__ == '__main__':
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
 
-    except KeyboardInterrupt:
-        logger_mp.info("KeyboardInterrupt, exiting program...")
+    # except KeyboardInterrupt:
+    #     logger_mp.info("KeyboardInterrupt, exiting program...")
+    except Exception as e:
+        logger_mp.error(f"Exception in main loop: {e}", exc_info=True)
+        STOP = True
     finally:
         arm_ctrl.ctrl_dual_arm_go_home()
 
